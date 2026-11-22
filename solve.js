@@ -13,8 +13,9 @@ const INCLUDE_DEPTH = 8;
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
+const ESC_TEST = /[&<>"']/;
 function escapeHtml(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  return ESC_TEST.test(text) ? text.replace(ESC_RE, (c) => ESCAPES[c]) : text;
 }
 
 const slugCache = new Map();
@@ -196,22 +197,27 @@ function isBlankLine(line) {
 }
 
 export function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
-      break;
-    }
+  // lines[0] === '---' iff the text is exactly '---' or starts with '---\n' (no \r: readSources normalises it).
+  if (text !== '---' && !text.startsWith('---\n')) return { error: 'no front matter' };
+  let closeIdx = text.indexOf('\n---\n', 3);
+  let bodyOff;
+  let fmText;
+  if (closeIdx !== -1) {
+    bodyOff = closeIdx + 5;
+    fmText = text.slice(4, closeIdx);
+  } else if (text.endsWith('\n---')) {
+    bodyOff = text.length;
+    fmText = text.slice(4, text.length - 4);
+  } else {
+    return { error: 'the front matter is not closed' };
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  const lines = fmText === '' ? [] : fmText.split('\n');
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
+  for (let j = 0; j < lines.length; j++) {
+    const line = lines[j];
     if (isBlankLine(line) || line.charCodeAt(0) === 35) continue;
     const m = fmLine(line);
-    if (m === null) return { error: `line ${i + 1} is not "key: value"` };
+    if (m === null) return { error: `line ${j + 2} is not "key: value"` };
     const key = m.key;
     const raw = m.raw;
     if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
@@ -222,9 +228,7 @@ export function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  let off = 0;
-  for (let i = 0; i <= close; i++) off += lines[i].length + 1;
-  return { data, body: text.slice(off) };
+  return { data, body: text.slice(bodyOff) };
 }
 
 /* ---------------------------------------------------------------- markdown */
@@ -383,9 +387,14 @@ function findSingleStar(s, from) {
 
 const WS_RE = /\s/;
 const INLINE_RE = /[\\`*\[&<>"']/g;
+const INLINE_TEST = /[\\`*\[&<>"']/;
+const MD_TEST = /[\\`*\[]/;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 export function inline(s, env) {
+  if (!INLINE_TEST.test(s)) return s;
+  // No Markdown constructs at all, only characters to escape: one replace does it.
+  if (!MD_TEST.test(s)) return escapeHtml(s);
   const re = INLINE_RE;
   re.lastIndex = 0;
   let out = '';
@@ -468,6 +477,38 @@ export function inline(s, env) {
  * `src` rendered: its HTML, table of contents and excerpt. Single pass over the
  * lines: no token array, blocks rendered straight into the output parts.
  */
+/** Render one list starting at lines[i]; returns [html, nextI]. */
+function renderList(lines, i, ordered, env) {
+  const items = [];
+  let start = 1;
+  if (ordered) {
+    const o0 = orderedOf(lines[i]);
+    start = o0.num;
+  }
+  const n = lines.length;
+  while (i < n) {
+    const m = ordered ? orderedOf(lines[i]) : bulletOf(lines[i]);
+    if (m !== null) {
+      items.push(trimLine(ordered ? m.text : m));
+      i++;
+    } else if (isContinued(lines[i])) {
+      items[items.length - 1] += `\n${trimLine(lines[i])}`;
+      i++;
+    } else break;
+  }
+  const tag = ordered ? 'ol' : 'ul';
+  const parts = [ordered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`, '\n'];
+  for (let q = 0; q < items.length; q++) {
+    parts.push(`<li>${inline(items[q], env)}</li>`, '\n');
+  }
+  parts.push(`</${tag}>`);
+  return [parts.join(''), i];
+}
+
+/**
+ * `src` rendered: its HTML, table of contents and excerpt. Single pass over the
+ * lines: no token array, blocks rendered straight into the output parts.
+ */
 export function renderMarkdown(src, env) {
   const lines = src.split('\n');
   const n = lines.length;
@@ -477,35 +518,52 @@ export function renderMarkdown(src, env) {
   let excerpt = null;
   let i = 0;
   while (i < n) {
-    const line = lines[i];
-    if (isBlank(line)) {
+    let line = lines[i];
+    const c0 = line.length === 0 ? -1 : line.charCodeAt(0);
+    if (c0 === -1) {
       i++;
       continue;
     }
-    const lang = fenceLang(line);
-    if (lang !== null) {
-      i++;
-      let s = `<pre><code${lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`}>`;
-      while (i < n && !isFenceClose(lines[i])) s += `${escapeHtml(lines[i++])}\n`;
-      i++;
-      out.push(`${s}</code></pre>`);
-      continue;
-    }
-    const hd = headingOf(line);
-    if (hd !== null) {
-      const id = uniqueSlug(slugify(hd.text), ids);
-      const html = inline(hd.text, env);
-      out.push(`<h${hd.depth} id="${id}">${html}</h${hd.depth}>`);
-      if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isHr(line)) {
-      out.push('<hr>');
-      i++;
-      continue;
-    }
-    if (line.charCodeAt(0) === 62) {
+    if (c0 === 32 || c0 === 9) {
+      // A space/tab-led line is a paragraph unless it is blank: no block opens on a space.
+      if (isBlank(line)) {
+        i++;
+        continue;
+      }
+    } else if (c0 === 96) {
+      const lang = fenceLang(line);
+      if (lang !== null) {
+        i++;
+        const code = [];
+        while (i < n && !isFenceClose(lines[i])) code.push(escapeHtml(lines[i++]));
+        i++;
+        out.push(`<pre><code${lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`}>${code.length === 0 ? '' : `${code.join('\n')}\n`}</code></pre>`);
+        continue;
+      }
+    } else if (c0 === 35) {
+      const hd = headingOf(line);
+      if (hd !== null) {
+        const id = uniqueSlug(slugify(hd.text), ids);
+        const html = inline(hd.text, env);
+        out.push(`<h${hd.depth} id="${id}">${html}</h${hd.depth}>`);
+        if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHr(line)) {
+        out.push('<hr>');
+        i++;
+        continue;
+      }
+      const b0 = bulletOf(line);
+      if (b0 !== null) {
+        const r = renderList(lines, i, false, env);
+        out.push(r[0]);
+        i = r[1];
+        continue;
+      }
+    } else if (c0 === 62) {
       const qlines = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         let l = lines[i++];
@@ -516,33 +574,38 @@ export function renderMarkdown(src, env) {
       }
       out.push(qlines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(qlines.join('\n'), env)}</p>\n</blockquote>`);
       continue;
-    }
-    const b0 = bulletOf(line);
-    const o0 = b0 === null ? orderedOf(line) : null;
-    if (b0 !== null || o0 !== null) {
-      const ordered = o0 !== null;
-      const items = [];
-      const start = ordered ? o0.num : 1;
-      while (i < n) {
-        const m = ordered ? orderedOf(lines[i]) : bulletOf(lines[i]);
-        if (m !== null) {
-          items.push(trimLine(ordered ? m.text : m));
-          i++;
-        } else if (isContinued(lines[i])) {
-          items[items.length - 1] += `\n${trimLine(lines[i])}`;
-          i++;
-        } else break;
+    } else if (c0 >= 48 && c0 <= 57) {
+      if (orderedOf(line) !== null) {
+        const r = renderList(lines, i, true, env);
+        out.push(r[0]);
+        i = r[1];
+        continue;
       }
-      const tag = ordered ? 'ol' : 'ul';
-      let s = `${ordered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`}\n`;
-      for (let q = 0; q < items.length; q++) s += `<li>${inline(items[q], env)}</li>\n`;
-      s += `</${tag}>`;
-      out.push(s);
-      continue;
     }
-    const body = [trimLine(line)];
-    i++;
-    while (i < n && !endsPara(lines[i])) body.push(trimLine(lines[i++]));
+    // Paragraph: collect lines until one ends it (blank, fence open, heading, rule).
+    // The continuation test is inline: a common line costs no function call at all.
+    const body = [];
+    for (;;) {
+      let a = 0;
+      let b = line.length;
+      while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
+      while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
+      body.push(a === 0 && b === line.length ? line : line.slice(a, b));
+      i++;
+      if (i >= n) break;
+      line = lines[i];
+      if (line === '') break;
+      const d = line.charCodeAt(0);
+      if (d === 32 || d === 9) {
+        if (isBlank(line)) break;
+      } else if (d === 96) {
+        if (fenceLang(line) !== null) break;
+      } else if (d === 35) {
+        if (headingOf(line) !== null) break;
+      } else if (d === 45 || d === 42) {
+        if (isHr(line)) break;
+      }
+    }
     const html = inline(body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     out.push(`<p>${html}</p>`);
@@ -670,8 +733,9 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-/** Render `nodes` into the `out` parts array, in `scope` (a prototype chain). */
-function renderNodes(nodes, scope, ctx, depth, out) {
+/** Render `nodes` into the `out` parts array, in `scope` (a prototype chain).
+ * `bound` holds the loop-variable names bound by enclosing for-loops. */
+function renderNodes(nodes, scope, ctx, depth, out, bound = new Set()) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     switch (n.kind) {
@@ -687,7 +751,7 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
+        if (branch !== null) renderNodes(branch, scope, ctx, depth, out, bound);
         break;
       }
       case 'for': {
@@ -695,29 +759,176 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         if (!Array.isArray(xs)) break;
         const child = Object.create(scope);
         const loop = { index: 0, first: false, last: false, length: xs.length };
+        const nb = new Set(bound);
+        nb.add(n.name);
         for (let k = 0; k < xs.length; k++) {
           child[n.name] = xs[k];
           child.loop = loop;
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          renderNodes(n.body, child, ctx, depth, out);
+          renderNodes(n.body, child, ctx, depth, out, nb);
         }
         break;
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) {
+          const mode = memoMode(ctx.free, n.name, bound);
+          if (mode === 'direct') {
+            renderNodes(t, scope, ctx, depth + 1, out, bound);
+          } else {
+            let key = `${n.name}:${depth}`;
+            if (mode === 'keyed') {
+              const f = [...ctx.free.get(n.name)].sort();
+              for (const r of f) key += `:${keyPart(ctx, scope[r])}`;
+            }
+            let c = ctx.cc.get(key);
+            if (c === undefined) {
+              const o = [];
+              renderNodes(t, scope, ctx, depth + 1, o, bound);
+              c = o.join('');
+              ctx.cc.set(key, c);
+            }
+            out.push(c);
+          }
+        }
         break;
       }
     }
   }
 }
 
-/** Compile a parsed template's nodes into a function (scope, ctx, depth, out, escapeHtml, textOf, truthy).
+/** Scope roots a template's nodes read that no enclosing for-loop binds.
+ * `bound`: names bound by enclosing fors; `path`: templates already on this include chain (cycle cut).
+ * The result is a union over every include site, so a root read anywhere counts. */
+function freeRoots(nodes, templates, bound, path) {
+  const out = new Set();
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      if (n.kind === 'if') {
+        for (const r of freeRoots(n.then, templates, bound, path)) out.add(r);
+        if (n.else !== null) for (const r of freeRoots(n.else, templates, bound, path)) out.add(r);
+      }
+      continue;
+    }
+    if (n.kind === 'for') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      // A for-loop binds its variable AND the implicit `loop` object for its body:
+      // reads of `loop` there refer to this loop's own object, whose variability flows
+      // through the iterated root above, not through a scope root.
+      const nb = new Set(bound);
+      nb.add(n.name);
+      nb.add('loop');
+      for (const r of freeRoots(n.body, templates, nb, path)) out.add(r);
+      continue;
+    }
+    if (n.kind === 'include') {
+      const t = templates.get(n.name);
+      if (t !== undefined && !path.has(n.name)) {
+        const np = new Set(path);
+        np.add(n.name);
+        for (const r of freeRoots(t, templates, bound, np)) out.add(r);
+      }
+      continue;
+    }
+  }
+  return out;
+}
+
+/** Free scope roots per template name (read with no enclosing for binding them). */
+function computeFreeSets(templates) {
+  const out = new Map();
+  for (const [name, nodes] of templates) out.set(name, freeRoots(nodes, templates, new Set(), new Set([name])));
+  return out;
+}
+
+/** Whether a for-loop's body reads the implicit `loop` object (first segment `loop`).
+ * Reads inside a nested for body refer to that loop's own object, so they are not descended into;
+ * a nested for iterating over `loop.*` does read the outer object, so its path is checked. */
+function bodyReadsLoop(nodes, templates, path) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (n.path[0] === 'loop') return true;
+    } else if (n.kind === 'if') {
+      if (n.path[0] === 'loop') return true;
+      if (bodyReadsLoop(n.then, templates, path)) return true;
+      if (n.else !== null && bodyReadsLoop(n.else, templates, path)) return true;
+    } else if (n.kind === 'for') {
+      if (n.path[0] === 'loop') return true;
+    } else if (n.kind === 'include') {
+      const t = templates.get(n.name);
+      if (t !== undefined && !path.has(n.name)) {
+        const np = new Set(path);
+        np.add(n.name);
+        if (bodyReadsLoop(t, templates, np)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** A cache-key part for one scope-root value: objects by a per-case id (their identity),
+ * primitives by type-tagged value. Only used for roots whose values never mutate while
+ * layouts render (card/tag objects, site/tags/recent): identity then means equal output. */
+function keyPart(ctx, v) {
+  if (v !== null && typeof v === 'object') {
+    let id = ctx.ids.get(v);
+    if (id === undefined) {
+      id = ++ctx.idSeq;
+      ctx.ids.set(v, id);
+    }
+    return `o${id}`;
+  }
+  if (typeof v === 'string') return `s${v.length}:${v}`;
+  if (typeof v === 'number') return `n${v}`;
+  if (typeof v === 'boolean') return v ? 'b1' : 'b0';
+  if (v === undefined) return 'u';
+  return 'l';
+}
+
+const KEYABLE_ROOTS = ['site', 'tags', 'recent', 'p', 't', 'h'];
+
+/** Memo mode for including `name` here: 'const' (reads only case constants, none shadowed
+ * by an enclosing loop variable), 'keyed' (reads only constants and loop variables p/t/h,
+ * whose values are part of the key), or 'direct' (anything else, e.g. reads `page`). */
+function memoMode(freeSets, name, bound) {
+  const f = freeSets.get(name);
+  if (f === undefined || f.has('loop')) return 'direct';
+  let allConst = true;
+  let allKeyable = true;
+  for (const r of f) {
+    if (r !== 'site' && r !== 'tags' && r !== 'recent') allConst = false;
+    if (!KEYABLE_ROOTS.includes(r)) allKeyable = false;
+  }
+  if (allConst && ![...f].some((r) => bound.has(r))) return 'const';
+  if (allKeyable) return 'keyed';
+  return 'direct';
+}
+
+/** Whether including `name` here renders the same string every time within a case:
+ * every free root it reads is a case-level constant (site/tags/recent) and none of them
+ * is shadowed by a loop variable bound at this include site. */
+function isConstantInclude(ctx, name, bound) {
+  const f = ctx.free ? ctx.free.get(name) : undefined;
+  if (f === undefined) return false;
+  for (const r of f) {
+    if (r !== 'site' && r !== 'tags' && r !== 'recent') return false;
+    if (bound.has(r)) return false;
+  }
+  return true;
+}
+
+/** Compile a parsed template's nodes into a function (scope, ctx, depth, out, E, T, U).
  * The generated code is straight-line: lookups inlined, no node walk, no switch.
+ * E/T/U are escapeHtml/textOf/truthy, inlined where cheap; a for-loop whose body never
+ * reads the implicit `loop` object skips the loop bookkeeping; an include of a template
+ * that reads only case-level constants (site/tags/recent) renders once per case and is
+ * then replayed from ctx.cc (keyed by template and depth).
  * Falls back to the interpreted renderNodes when the Function constructor is unavailable. */
-function compileTemplate(nodes) {
+function compileTemplate(nodes, templates, freeSets, selfName) {
   const uid = { n: 0 };
   const code = [];
   // Emit the lookup of `path` in scope `sv` as statements; return the temp or expression holding the value.
@@ -730,7 +941,8 @@ function compileTemplate(nodes) {
     }
     return v;
   };
-  const gen = (ns, sv, dv) => {
+  const truthyExpr = (v) => `(Array.isArray(${v})?${v}.length>0:(${v}!==undefined&&${v}!==null&&${v}!==false&&${v}!==''&&${v}!==0))`;
+  const gen = (ns, sv, dv, bound) => {
     for (const n of ns) {
       if (n.kind === 'text') {
         code.push(`out.push(${JSON.stringify(n.text)});`);
@@ -738,21 +950,21 @@ function compileTemplate(nodes) {
       }
       if (n.kind === 'var') {
         const v = emitLookup(n.path, sv);
-        code.push(`out.push(escapeHtml(textOf(${v})));`);
+        code.push(`out.push(typeof ${v}==='string'?E(${v}):T(${v}));`);
         continue;
       }
       if (n.kind === 'raw') {
         const v = emitLookup(n.path, sv);
-        code.push(`out.push(textOf(${v}));`);
+        code.push(`out.push(typeof ${v}==='string'?${v}:T(${v}));`);
         continue;
       }
       if (n.kind === 'if') {
         const v = emitLookup(n.path, sv);
-        code.push(`if(truthy(${v})!==${n.not}){`);
-        gen(n.then, sv, dv);
+        code.push(`if(${truthyExpr(v)}!==${n.not}){`);
+        gen(n.then, sv, dv, bound);
         if (n.else !== null) {
           code.push('}else{');
-          gen(n.else, sv, dv);
+          gen(n.else, sv, dv, bound);
         }
         code.push('}');
         continue;
@@ -761,28 +973,63 @@ function compileTemplate(nodes) {
         const xs = emitLookup(n.path, sv);
         const arr = `_a${uid.n++}`;
         const child = `_s${uid.n++}`;
-        const loop = `_l${uid.n++}`;
         const k = `_k${uid.n++}`;
+        const nb = new Set(bound);
+        nb.add(n.name);
         code.push(`const ${arr}=${xs};`);
-        code.push(`if(Array.isArray(${arr})){const ${child}=Object.create(${sv});const ${loop}={index:0,first:false,last:false,length:${arr}.length};for(let ${k}=0;${k}<${arr}.length;${k}++){${child}[${JSON.stringify(n.name)}]=${arr}[${k}];${child}.loop=${loop};${loop}.index=${k}+1;${loop}.first=${k}===0;${loop}.last=${k}===${arr}.length-1;`);
-        gen(n.body, child, dv);
+        if (bodyReadsLoop(n.body, templates, new Set([selfName]))) {
+          const loop = `_l${uid.n++}`;
+          code.push(`if(Array.isArray(${arr})){const ${child}=Object.create(${sv});const ${loop}={index:0,first:false,last:false,length:${arr}.length};for(let ${k}=0;${k}<${arr}.length;${k}++){${child}[${JSON.stringify(n.name)}]=${arr}[${k}];${child}.loop=${loop};${loop}.index=${k}+1;${loop}.first=${k}===0;${loop}.last=${k}===${arr}.length-1;`);
+        } else {
+          code.push(`if(Array.isArray(${arr})){const ${child}=Object.create(${sv});for(let ${k}=0;${k}<${arr}.length;${k}++){${child}[${JSON.stringify(n.name)}]=${arr}[${k}];`);
+        }
+        gen(n.body, child, dv, nb);
         code.push('}}');
         continue;
       }
       if (n.kind === 'include') {
         const t = `_t${uid.n++}`;
-        code.push(`const ${t}=ctx.templates.get(${JSON.stringify(n.name)});if(${t}!==undefined&&${dv}<8)${t}(${sv},ctx,${dv}+1,out,escapeHtml,textOf,truthy);`);
+        const mode = memoMode(freeSets, n.name, bound);
+        if (mode === 'direct') {
+          code.push(`const ${t}=ctx.templates.get(${JSON.stringify(n.name)});if(${t}!==undefined&&${dv}<8)${t}(${sv},ctx,${dv}+1,out,E,T,U);`);
+        } else {
+          const kk = `_k${uid.n++}`;
+          const cc = `_c${uid.n++}`;
+          const oo = `_o${uid.n++}`;
+          let keyExpr = `${JSON.stringify(`${n.name}:`)}+${dv}`;
+          if (mode === 'keyed') {
+            const f = [...freeSets.get(n.name)].sort();
+            for (const r of f) keyExpr += `+":" +ctx.kp(ctx,${sv}.${r})`;
+          }
+          code.push(`const ${t}=ctx.templates.get(${JSON.stringify(n.name)});if(${t}!==undefined&&${dv}<8){const ${kk}=${keyExpr};let ${cc}=ctx.cc.get(${kk});if(${cc}===undefined){const ${oo}=[];${t}(${sv},ctx,${dv}+1,${oo},E,T,U);${cc}=${oo}.join('');ctx.cc.set(${kk},${cc});}out.push(${cc});}`);
+        }
         continue;
       }
     }
   };
-  gen(nodes, 'scope', 'depth');
-  return new Function('scope', 'ctx', 'depth', 'out', 'escapeHtml', 'textOf', 'truthy', code.join('\n'));
+  gen(nodes, 'scope', 'depth', new Set());
+  return new Function('scope', 'ctx', 'depth', 'out', 'E', 'T', 'U', code.join('\n'));
 }
 
 /* -------------------------------------------------------------------- build */
 
 function resolvePath(dir, rel) {
+  // Fast path: no dot segments, no empty segments, no trailing slash, so the result
+  // is just dir + '/' + rel (or rel when dir is empty). The checks exclude every input
+  // where the loop below would skip or pop a segment.
+  if (
+    rel !== '' &&
+    rel.indexOf('..') === -1 &&
+    rel.indexOf('//') === -1 &&
+    rel !== '.' &&
+    !rel.startsWith('/') &&
+    !rel.startsWith('./') &&
+    rel.indexOf('/./') === -1 &&
+    !rel.endsWith('/.') &&
+    !rel.endsWith('/')
+  ) {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -889,6 +1136,7 @@ function collections(b) {
   posts.forEach((p, k) => {
     p.newer = k === 0 ? null : posts[k - 1];
     p.older = k === posts.length - 1 ? null : posts[k + 1];
+    p.link = linkOf(p);
   });
 }
 
@@ -929,30 +1177,60 @@ function tags(b) {
 
 const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
 
+// reading_minutes needs a regex word count over the body and only some layouts read it:
+// compute it on first read (per source, at most once) via a lazy getter.
+function readingMinutes(s) {
+  if (s.minutes === undefined) s.minutes = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+  return s.minutes;
+}
+
+function lazyMinutes(obj, s) {
+  Object.defineProperty(obj, 'reading_minutes', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      const v = readingMinutes(s);
+      Object.defineProperty(obj, 'reading_minutes', { value: v, enumerable: true });
+      return v;
+    },
+  });
+}
+
 function cardOf(s) {
-  return {
+  const card = {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
     date_long: s.data.date === undefined ? '' : longDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   };
+  lazyMinutes(card, s);
+  return card;
 }
 
 function pageOf(b, s) {
   const base = s.post ? b.cards.get(s) : cardOf(s);
-  return {
-    ...base,
+  // Copy the cheap card fields explicitly (no spread: spreading would invoke the
+  // lazy reading_minutes getter on the card and pay the word count up front).
+  const page = {
+    title: base.title,
+    url: base.url,
+    date: base.date,
+    date_long: base.date_long,
+    summary: base.summary,
+    excerpt: base.excerpt,
+    tags: base.tags,
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
+    toc: s.toc,
+    newer: s.newer ? s.newer.link : null,
+    older: s.older ? s.older.link : null,
     is_post: s.post,
   };
+  lazyMinutes(page, s);
+  return page;
 }
 
 function layouts(b) {
@@ -960,7 +1238,7 @@ function layouts(b) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const ctx = { templates: b.templates, escape: escapeHtml, free: b.free, cc: new Map(), kp: keyPart, ids: new WeakMap(), idSeq: 0 };
   const tagOf = (t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
   const baseScope = Object.create(null);
   baseScope.site = site;
@@ -973,7 +1251,7 @@ function layouts(b) {
     Object.assign(scope, vars);
     const out = [];
     if (typeof fn === 'function') fn(scope, ctx, 0, out, escapeHtml, textOf, truthy);
-    else renderNodes(fn, scope, ctx, 0, out);
+    else renderNodes(fn, scope, ctx, 0, out, new Set());
     return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(b, s) });
@@ -1007,10 +1285,10 @@ function report(b) {
 }
 
 /** Compile every parsed template; on any failure return the parsed nodes (interpreted path). */
-function compiledTemplates(templates) {
+function compiledTemplates(templates, freeSets) {
   try {
     const fns = new Map();
-    for (const [name, nodes] of templates) fns.set(name, compileTemplate(nodes));
+    for (const [name, nodes] of templates) fns.set(name, compileTemplate(nodes, templates, freeSets, name));
     return fns;
   } catch {
     return templates;
@@ -1028,10 +1306,12 @@ export function run(input) {
       reportLines.push(err.message);
     }
   }
+  const freeSets = computeFreeSets(templates);
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
-    templates: compiledTemplates(templates),
+    templates: compiledTemplates(templates, freeSets),
+    free: freeSets,
     sources: [],
     statics: [],
     bySource: new Map(),
