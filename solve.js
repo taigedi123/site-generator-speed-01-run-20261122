@@ -382,10 +382,12 @@ function findSingleStar(s, from) {
 }
 
 const WS_RE = /\s/;
+const INLINE_RE = /[\\`*\[&<>"']/g;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 export function inline(s, env) {
-  const re = /[\\`*\[&<>"']/g;
+  const re = INLINE_RE;
+  re.lastIndex = 0;
   let out = '';
   let pos = 0;
   let m;
@@ -712,6 +714,72 @@ function renderNodes(nodes, scope, ctx, depth, out) {
   }
 }
 
+/** Compile a parsed template's nodes into a function (scope, ctx, depth, out, escapeHtml, textOf, truthy).
+ * The generated code is straight-line: lookups inlined, no node walk, no switch.
+ * Falls back to the interpreted renderNodes when the Function constructor is unavailable. */
+function compileTemplate(nodes) {
+  const uid = { n: 0 };
+  const code = [];
+  // Emit the lookup of `path` in scope `sv` as statements; return the temp or expression holding the value.
+  const emitLookup = (path, sv) => {
+    if (path.length === 1) return `${sv}.${path[0]}`;
+    const v = `_u${uid.n++}`;
+    code.push(`let ${v}=${sv}.${path[0]};`);
+    for (let k = 1; k < path.length; k++) {
+      code.push(`if(${v}===null||typeof ${v}!=='object'||!Object.hasOwn(${v},${JSON.stringify(path[k])})){${v}=undefined;}else{${v}=${v}.${path[k]};}`);
+    }
+    return v;
+  };
+  const gen = (ns, sv, dv) => {
+    for (const n of ns) {
+      if (n.kind === 'text') {
+        code.push(`out.push(${JSON.stringify(n.text)});`);
+        continue;
+      }
+      if (n.kind === 'var') {
+        const v = emitLookup(n.path, sv);
+        code.push(`out.push(escapeHtml(textOf(${v})));`);
+        continue;
+      }
+      if (n.kind === 'raw') {
+        const v = emitLookup(n.path, sv);
+        code.push(`out.push(textOf(${v}));`);
+        continue;
+      }
+      if (n.kind === 'if') {
+        const v = emitLookup(n.path, sv);
+        code.push(`if(truthy(${v})!==${n.not}){`);
+        gen(n.then, sv, dv);
+        if (n.else !== null) {
+          code.push('}else{');
+          gen(n.else, sv, dv);
+        }
+        code.push('}');
+        continue;
+      }
+      if (n.kind === 'for') {
+        const xs = emitLookup(n.path, sv);
+        const arr = `_a${uid.n++}`;
+        const child = `_s${uid.n++}`;
+        const loop = `_l${uid.n++}`;
+        const k = `_k${uid.n++}`;
+        code.push(`const ${arr}=${xs};`);
+        code.push(`if(Array.isArray(${arr})){const ${child}=Object.create(${sv});const ${loop}={index:0,first:false,last:false,length:${arr}.length};for(let ${k}=0;${k}<${arr}.length;${k}++){${child}[${JSON.stringify(n.name)}]=${arr}[${k}];${child}.loop=${loop};${loop}.index=${k}+1;${loop}.first=${k}===0;${loop}.last=${k}===${arr}.length-1;`);
+        gen(n.body, child, dv);
+        code.push('}}');
+        continue;
+      }
+      if (n.kind === 'include') {
+        const t = `_t${uid.n++}`;
+        code.push(`const ${t}=ctx.templates.get(${JSON.stringify(n.name)});if(${t}!==undefined&&${dv}<8)${t}(${sv},ctx,${dv}+1,out,escapeHtml,textOf,truthy);`);
+        continue;
+      }
+    }
+  };
+  gen(nodes, 'scope', 'depth');
+  return new Function('scope', 'ctx', 'depth', 'out', 'escapeHtml', 'textOf', 'truthy', code.join('\n'));
+}
+
 /* -------------------------------------------------------------------- build */
 
 function resolvePath(dir, rel) {
@@ -894,16 +962,18 @@ function layouts(b) {
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
   const ctx = { templates: b.templates, escape: escapeHtml };
   const tagOf = (t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
+  const baseScope = Object.create(null);
+  baseScope.site = site;
+  baseScope.tags = allTags;
+  baseScope.recent = recent;
   const render = (name, vars) => {
-    const nodes = b.templates.get(name);
-    if (nodes === undefined) return null;
-    const scope = Object.create(null);
-    scope.site = site;
-    scope.tags = allTags;
-    scope.recent = recent;
+    const fn = b.templates.get(name);
+    if (fn === undefined) return null;
+    const scope = Object.create(baseScope);
     Object.assign(scope, vars);
     const out = [];
-    renderNodes(nodes, scope, ctx, 0, out);
+    if (typeof fn === 'function') fn(scope, ctx, 0, out, escapeHtml, textOf, truthy);
+    else renderNodes(fn, scope, ctx, 0, out);
     return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(b, s) });
@@ -936,6 +1006,17 @@ function report(b) {
   b.output[REPORT_FILE] = `${lines.join('\n')}\n`;
 }
 
+/** Compile every parsed template; on any failure return the parsed nodes (interpreted path). */
+function compiledTemplates(templates) {
+  try {
+    const fns = new Map();
+    for (const [name, nodes] of templates) fns.set(name, compileTemplate(nodes));
+    return fns;
+  } catch {
+    return templates;
+  }
+}
+
 export function run(input) {
   const templates = new Map();
   const reportLines = [];
@@ -950,7 +1031,7 @@ export function run(input) {
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
-    templates,
+    templates: compiledTemplates(templates),
     sources: [],
     statics: [],
     bySource: new Map(),
